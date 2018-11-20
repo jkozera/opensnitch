@@ -30,41 +30,62 @@ type Connection struct {
 
 func Parse(nfp netfilter.Packet) *Connection {
 	ipLayer := nfp.Packet.Layer(layers.LayerTypeIPv4)
-	if ipLayer == nil {
+	ipLayer6 := nfp.Packet.Layer(layers.LayerTypeIPv6)
+	if ipLayer == nil && ipLayer6 == nil {
 		return nil
 	}
 
-	ip, ok := ipLayer.(*layers.IPv4)
-	if ok == false || ip == nil {
-		return nil
+	if (ipLayer == nil) {
+		ip, ok := ipLayer6.(*layers.IPv6)
+		if ok == false || ip == nil {
+			return nil
+		}
+
+		// we're not interested in connections
+		// from/to the localhost interface
+		if ip.SrcIP.IsLoopback() {
+			return nil
+		}
+
+		// skip multicast stuff
+		if ip.SrcIP.IsMulticast() || ip.DstIP.IsMulticast() {
+			return nil
+		}
+
+		con, err := NewConnection6(&nfp, ip)
+		if err != nil {
+			log.Debug("%s", err)
+			return nil
+		} else if con == nil {
+			return nil
+		}
+		return con
+	} else {
+		ip, ok := ipLayer.(*layers.IPv4)
+		if ok == false || ip == nil {
+			return nil
+		}
+
+		// we're not interested in connections
+		// from/to the localhost interface
+		if ip.SrcIP.IsLoopback() {
+			return nil
+		}
+
+		// skip multicast stuff
+		if ip.SrcIP.IsMulticast() || ip.DstIP.IsMulticast() {
+			return nil
+		}
+
+		con, err := NewConnection(&nfp, ip)
+		if err != nil {
+			log.Debug("%s", err)
+			return nil
+		} else if con == nil {
+			return nil
+		}
+		return con
 	}
-
-	// we're not interested in connections
-	// from/to the localhost interface
-	if ip.SrcIP.IsLoopback() {
-		return nil
-	}
-
-	// skip multicast stuff
-	if ip.SrcIP.IsMulticast() || ip.DstIP.IsMulticast() {
-		return nil
-	}
-
-	// skip broadcasted stuff
-	// FIXME: this is ugly
-	//if ip.DstIP[3] == 0xff {
-	//	return nil
-	//}
-
-	con, err := NewConnection(&nfp, ip)
-	if err != nil {
-		log.Debug("%s", err)
-		return nil
-	} else if con == nil {
-		return nil
-	}
-
-	return con
 }
 
 func NewConnection(nfp *netfilter.Packet, ip *layers.IPv4) (c *Connection, err error) {
@@ -96,26 +117,63 @@ func NewConnection(nfp *netfilter.Packet, ip *layers.IPv4) (c *Connection, err e
 	return c, nil
 }
 
+func NewConnection6(nfp *netfilter.Packet, ip *layers.IPv6) (c *Connection, err error) {
+	c = &Connection{
+		SrcIP:   ip.SrcIP,
+		DstIP:   ip.DstIP,
+		DstHost: dns.HostOr(ip.DstIP, ip.DstIP.String()),
+		pkt:     nfp,
+	}
+
+	// no errors but not enough info neither
+	if c.parseDirection() == false {
+		return nil, nil
+	}
+
+	// 1. lookup uid and inode using /proc/net/(udp|tcp)
+	// 2. lookup pid by inode
+	// 3. if this is coming from us, just accept
+	// 4. lookup process info by pid
+	if c.Entry = netstat.FindEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort); c.Entry == nil {
+		return nil, fmt.Errorf("Could not find netstat entry for: %s", c)
+	} else if pid := procmon.GetPIDFromINode(c.Entry.INode); pid == -1 {
+		return nil, fmt.Errorf("Could not find process id for: %s", c)
+	} else if pid == os.Getpid() {
+		return nil, nil
+	} else if c.Process = procmon.FindProcess(pid); c.Process == nil {
+		return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
+	}
+	return c, nil
+}
+
 func (c *Connection) parseDirection() bool {
+	ret := false
 	for _, layer := range c.pkt.Packet.Layers() {
 		if layer.LayerType() == layers.LayerTypeTCP {
 			if tcp, ok := layer.(*layers.TCP); ok == true && tcp != nil {
 				c.Protocol = "tcp"
 				c.DstPort = int(tcp.DstPort)
 				c.SrcPort = int(tcp.SrcPort)
-				return true
+				ret = true
 			}
 		} else if layer.LayerType() == layers.LayerTypeUDP {
 			if udp, ok := layer.(*layers.UDP); ok == true && udp != nil {
 				c.Protocol = "udp"
 				c.DstPort = int(udp.DstPort)
 				c.SrcPort = int(udp.SrcPort)
-				return true
+				ret = true
 			}
 		}
 	}
 
-	return false
+	for _, layer := range c.pkt.Packet.Layers() {
+		if layer.LayerType() == layers.LayerTypeIPv6 {
+			if tcp, ok := layer.(*layers.IPv6); ok == true && tcp != nil {
+				c.Protocol += "6"
+			}
+		}
+	}
+	return ret
 }
 
 func (c *Connection) To() string {

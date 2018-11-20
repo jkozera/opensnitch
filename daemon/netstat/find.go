@@ -14,6 +14,9 @@ func FindEntry(proto string, srcIP net.IP, srcPort int, dstIP net.IP, dstPort in
 	}
 
 	for _, entry := range entries {
+		if proto == "udp" && srcPort == entry.SrcPort {
+			return &entry
+		}
 		if srcIP.Equal(entry.SrcIP) && srcPort == entry.SrcPort && dstIP.Equal(entry.DstIP) && dstPort == entry.DstPort {
 			return &entry
 		}

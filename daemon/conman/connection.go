@@ -52,9 +52,9 @@ func Parse(nfp netfilter.Packet) *Connection {
 
 	// skip broadcasted stuff
 	// FIXME: this is ugly
-	if ip.DstIP[3] == 0xff {
-		return nil
-	}
+	//if ip.DstIP[3] == 0xff {
+	//	return nil
+	//}
 
 	con, err := NewConnection(&nfp, ip)
 	if err != nil {

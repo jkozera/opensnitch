@@ -134,7 +134,7 @@ func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasM
 		s.RuleHits++
 	}
 
-	if match.Action == rule.Allow {
+	if match != nil && match.Action == rule.Allow {
 		s.Accepted++
 	} else {
 		s.Dropped++
@@ -146,8 +146,12 @@ func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasM
 		s.incMap(&s.ByHost, con.DstHost)
 	}
 	s.incMap(&s.ByPort, fmt.Sprintf("%d", con.DstPort))
-	s.incMap(&s.ByUID, fmt.Sprintf("%d", con.Entry.UserId))
-	s.incMap(&s.ByExecutable, con.Process.Path)
+	if (con.Entry != nil) {
+		s.incMap(&s.ByUID, fmt.Sprintf("%d", con.Entry.UserId))
+	}
+	if (con.Process != nil) {
+		s.incMap(&s.ByExecutable, con.Process.Path)
+	}
 
 	// if we reached the limit, shift everything back
 	// by one position

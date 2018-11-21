@@ -100,9 +100,9 @@ func (o *Operator) Match(con *conman.Connection) bool {
 	} else if o.Operand == OpUserId {
 		return o.cb(fmt.Sprintf("%d", con.Entry.UserId))
 	} else if o.Operand == OpProcessPath {
-		return o.cb(con.Process.Path)
+		return con.Process != nil && o.cb(con.Process.Path)
 	} else if o.Operand == OpProcessCmd {
-		return o.cb(strings.Join(con.Process.Args, " "))
+		return con.Process != nil && o.cb(strings.Join(con.Process.Args, " "))
 	} else if strings.HasPrefix(string(o.Operand), string(OpProcessEnvPrefix)) {
 		envVarName := core.Trim(string(o.Operand[OpProcessEnvPrefixLen:]))
 		envVarValue, _ := con.Process.Env[envVarName]

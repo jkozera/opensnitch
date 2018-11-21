@@ -41,17 +41,6 @@ func Parse(nfp netfilter.Packet) *Connection {
 			return nil
 		}
 
-		// we're not interested in connections
-		// from/to the localhost interface
-		if ip.SrcIP.IsLoopback() {
-			return nil
-		}
-
-		// skip multicast stuff
-		if ip.SrcIP.IsMulticast() || ip.DstIP.IsMulticast() {
-			return nil
-		}
-
 		con, err := NewConnection6(&nfp, ip)
 		if err != nil {
 			log.Debug("%s", err)
@@ -66,26 +55,42 @@ func Parse(nfp netfilter.Packet) *Connection {
 			return nil
 		}
 
-		// we're not interested in connections
-		// from/to the localhost interface
-		if ip.SrcIP.IsLoopback() {
-			return nil
-		}
-
-		// skip multicast stuff
-		if ip.SrcIP.IsMulticast() || ip.DstIP.IsMulticast() {
-			return nil
-		}
-
 		con, err := NewConnection(&nfp, ip)
 		if err != nil {
 			log.Debug("%s", err)
-			return nil
+			return con
 		} else if con == nil {
 			return nil
 		}
 		return con
 	}
+}
+
+func newConnectionImpl(nfp *netfilter.Packet, c *Connection) (cr *Connection, err error) {
+	// no errors but not enough info neither
+	if c.parseDirection() == false {
+		return nil, nil
+	}
+
+	// 1. lookup uid and inode using /proc/net/(udp|tcp)
+	// 2. lookup pid by inode
+	// 3. if this is coming from us, just accept
+	// 4. lookup process info by pid
+	if c.Entry = netstat.FindEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort); c.Entry == nil {
+		entry := netstat.NewEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort, nfp.Uid, -1)
+		c.Entry = &entry
+		c.Process = procmon.NewProcess(-1, "")
+		return c, fmt.Errorf("Could not find netstat entry for: %s", c)
+	} else if pid := procmon.GetPIDFromINode(c.Entry.INode); pid == -1 {
+		c.Process = procmon.NewProcess(-1, "")
+		return c, fmt.Errorf("Could not find process id for: %s", c)
+	} else if pid == os.Getpid() {
+		return nil, nil
+	} else if c.Process = procmon.FindProcess(pid); c.Process == nil {
+		return c, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
+	}
+	return c, nil
+
 }
 
 func NewConnection(nfp *netfilter.Packet, ip *layers.IPv4) (c *Connection, err error) {
@@ -95,26 +100,7 @@ func NewConnection(nfp *netfilter.Packet, ip *layers.IPv4) (c *Connection, err e
 		DstHost: dns.HostOr(ip.DstIP, ip.DstIP.String()),
 		pkt:     nfp,
 	}
-
-	// no errors but not enough info neither
-	if c.parseDirection() == false {
-		return nil, nil
-	}
-
-	// 1. lookup uid and inode using /proc/net/(udp|tcp)
-	// 2. lookup pid by inode
-	// 3. if this is coming from us, just accept
-	// 4. lookup process info by pid
-	if c.Entry = netstat.FindEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort); c.Entry == nil {
-		return nil, fmt.Errorf("Could not find netstat entry for: %s", c)
-	} else if pid := procmon.GetPIDFromINode(c.Entry.INode); pid == -1 {
-		return nil, fmt.Errorf("Could not find process id for: %s", c)
-	} else if pid == os.Getpid() {
-		return nil, nil
-	} else if c.Process = procmon.FindProcess(pid); c.Process == nil {
-		return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
-	}
-	return c, nil
+	return newConnectionImpl(nfp, c)
 }
 
 func NewConnection6(nfp *netfilter.Packet, ip *layers.IPv6) (c *Connection, err error) {
@@ -124,26 +110,7 @@ func NewConnection6(nfp *netfilter.Packet, ip *layers.IPv6) (c *Connection, err 
 		DstHost: dns.HostOr(ip.DstIP, ip.DstIP.String()),
 		pkt:     nfp,
 	}
-
-	// no errors but not enough info neither
-	if c.parseDirection() == false {
-		return nil, nil
-	}
-
-	// 1. lookup uid and inode using /proc/net/(udp|tcp)
-	// 2. lookup pid by inode
-	// 3. if this is coming from us, just accept
-	// 4. lookup process info by pid
-	if c.Entry = netstat.FindEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort); c.Entry == nil {
-		return nil, fmt.Errorf("Could not find netstat entry for: %s", c)
-	} else if pid := procmon.GetPIDFromINode(c.Entry.INode); pid == -1 {
-		return nil, fmt.Errorf("Could not find process id for: %s", c)
-	} else if pid == os.Getpid() {
-		return nil, nil
-	} else if c.Process = procmon.FindProcess(pid); c.Process == nil {
-		return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
-	}
-	return c, nil
+	return newConnectionImpl(nfp, c)
 }
 
 func (c *Connection) parseDirection() bool {
@@ -184,11 +151,11 @@ func (c *Connection) To() string {
 }
 
 func (c *Connection) String() string {
-	if c.Entry == nil {
-		return fmt.Sprintf("%s ->(%s)-> %s:%d", c.SrcIP, c.Protocol, c.To(), c.DstPort)
+	if c.Entry == nil || c.Entry.INode == -1 {
+		return fmt.Sprintf("%s:%d ->(%s)-> %s:%d", c.SrcIP, c.SrcPort, c.Protocol, c.To(), c.DstPort)
 	}
 
-	if c.Process == nil {
+	if c.Process == nil || c.Process.ID == -1 {
 		return fmt.Sprintf("%s (uid:%d) ->(%s)-> %s:%d", c.SrcIP, c.Entry.UserId, c.Protocol, c.To(), c.DstPort)
 	}
 
@@ -196,6 +163,18 @@ func (c *Connection) String() string {
 }
 
 func (c *Connection) Serialize() *protocol.Connection {
+	uid := uint32(0)
+	pid := uint32(0)
+	path := ""
+	args := make([]string, 0)
+	if (c.Process != nil) {
+		path = c.Process.Path
+		args = c.Process.Args
+		pid = uint32(c.Process.ID)
+	}
+	if (c.Entry != nil) {
+		uid = uint32(c.Entry.UserId)
+	}
 	return &protocol.Connection{
 		Protocol:    c.Protocol,
 		SrcIp:       c.SrcIP.String(),
@@ -203,9 +182,9 @@ func (c *Connection) Serialize() *protocol.Connection {
 		DstIp:       c.DstIP.String(),
 		DstHost:     c.DstHost,
 		DstPort:     uint32(c.DstPort),
-		UserId:      uint32(c.Entry.UserId),
-		ProcessId:   uint32(c.Process.ID),
-		ProcessPath: c.Process.Path,
-		ProcessArgs: c.Process.Args,
+		UserId:      uid,
+		ProcessId:   pid,
+		ProcessPath: path,
+		ProcessArgs: args,
 	}
 }

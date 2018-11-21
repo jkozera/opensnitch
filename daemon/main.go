@@ -147,8 +147,9 @@ func onPacket(packet netfilter.Packet) {
 	// Parse the connection state
 	con := conman.Parse(packet)
 	if con == nil {
-		packet.SetVerdict(netfilter.NF_ACCEPT)
-		stats.OnIgnored()
+		log.Error("con is nil - DROPPING!")
+		packet.SetVerdict(netfilter.NF_DROP)
+		stats.OnConnectionEvent(con, nil, true)
 		return
 	}
 
@@ -198,6 +199,11 @@ func onPacket(packet netfilter.Packet) {
 
 	stats.OnConnectionEvent(con, r, missed)
 
+	path := ""
+	if con.Process != nil {
+		path = con.Process.Path
+	}
+
 	if r.Action == rule.Allow {
 		packet.SetVerdict(netfilter.NF_ACCEPT)
 
@@ -205,11 +211,10 @@ func onPacket(packet netfilter.Packet) {
 		if r.Operator.Operand == rule.OpTrue {
 			ruleName = log.Dim(r.Name)
 		}
-		log.Debug("%s %s -> %s:%d (%s)", log.Bold(log.Green("✔")), log.Bold(con.Process.Path), log.Bold(con.To()), con.DstPort, ruleName)
+		log.Debug("%s %s -> %s:%d (%s)", log.Bold(log.Green("✔")), log.Bold(path), log.Bold(con.To()), con.DstPort, ruleName)
 	} else {
 		packet.SetVerdictAndMark(netfilter.NF_DROP, firewall.DropMark)
-
-		log.Warning("%s %s -> %s:%d (%s)", log.Bold(log.Red("✘")), log.Bold(con.Process.Path), log.Bold(con.To()), con.DstPort, log.Red(r.Name))
+		log.Warning("%s %s -> %s:%d (%s)", log.Bold(log.Red("✘")), log.Bold(path), log.Bold(con.To()), con.DstPort, log.Red(r.Name))
 	}
 }
 

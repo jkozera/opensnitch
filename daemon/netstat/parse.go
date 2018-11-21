@@ -82,11 +82,13 @@ func hexToIP(h string) net.IP {
 	return ip
 }
 
-func Parse(proto string) ([]Entry, error) {
+func Parse(proto string) ([]Entry, error, []string) {
 	filename := fmt.Sprintf("/proc/net/%s", proto)
 	fd, err := os.Open(filename)
+	lines := make([]string, 0)
+
 	if err != nil {
-		return nil, err
+		return nil, err, lines
 	}
 	defer fd.Close()
 
@@ -99,6 +101,7 @@ func Parse(proto string) ([]Entry, error) {
 		}
 
 		line := core.Trim(scanner.Text())
+		lines = append(lines, line)
 		m := parser.FindStringSubmatch(line)
 		if m == nil {
 			log.Warning("Could not parse netstat line from %s: %s", filename, line)
@@ -116,5 +119,5 @@ func Parse(proto string) ([]Entry, error) {
 		))
 	}
 
-	return entries, nil
+	return entries, nil, lines
 }

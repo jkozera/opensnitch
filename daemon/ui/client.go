@@ -148,7 +148,8 @@ func (c *Client) Ask(con *conman.Connection) (*rule.Rule, bool) {
 	c.Lock()
 	defer c.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	// FIXME: 360 should be really the client-set timeout (default_timeout in ui-config.json)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*360)
 	defer cancel()
 	reply, err := c.client.AskRule(ctx, con.Serialize())
 	if err != nil {

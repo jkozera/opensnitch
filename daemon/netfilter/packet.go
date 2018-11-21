@@ -17,6 +17,7 @@ type VerdictContainer struct {
 type Packet struct {
 	Packet         gopacket.Packet
 	Mark           uint32
+	Uid	           int
 	verdictChannel chan VerdictContainer
 }
 

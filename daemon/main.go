@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -11,25 +13,193 @@ import (
 	"runtime/pprof"
 	"syscall"
 
+	bpf "github.com/iovisor/gobpf/bcc"
+
 	"github.com/evilsocket/opensnitch/daemon/conman"
 	"github.com/evilsocket/opensnitch/daemon/core"
 	"github.com/evilsocket/opensnitch/daemon/dns"
 	"github.com/evilsocket/opensnitch/daemon/firewall"
 	"github.com/evilsocket/opensnitch/daemon/log"
 	"github.com/evilsocket/opensnitch/daemon/netfilter"
+	"github.com/evilsocket/opensnitch/daemon/netstat"
 	"github.com/evilsocket/opensnitch/daemon/procmon"
 	"github.com/evilsocket/opensnitch/daemon/rule"
 	"github.com/evilsocket/opensnitch/daemon/statistics"
 	"github.com/evilsocket/opensnitch/daemon/ui"
 )
 
+import "C"
+
+
+// based on https://github.com/iovisor/bcc/blob/master/tools/tcpconnect.py (Apache licensed)
+const source string = `
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <bcc/proto.h>
+
+BPF_HASH(currsock, u32, struct sock *);
+BPF_HASH(currsock_udp, u32, struct sock *);
+
+// separate data structs for ipv4 and ipv6
+struct ipv4_data_t {
+	u64 ts_us;
+	u32 pid;
+	u32 saddr;
+	u16 sport;
+	u32 daddr;
+	u64 ip;
+	u16 dport;
+	u8 udp;
+} __attribute__((packed));
+BPF_PERF_OUTPUT(ipv4_events);
+
+struct ipv6_data_t {
+	u64 ts_us;
+	u32 pid;
+	unsigned __int128 saddr;
+	u16 sport;
+	unsigned __int128 daddr;
+	u64 ip;
+	u16 dport;
+	u8 udp;
+} __attribute__((packed));
+BPF_PERF_OUTPUT(ipv6_events);
+
+int trace_connect_entry(struct pt_regs *ctx, struct sock *sk)
+{
+	u32 pid = bpf_get_current_pid_tgid();
+
+	// stash the sock ptr for lookup on return
+	currsock.update(&pid, &sk);
+
+	return 0;
+};
+
+int trace_connect_entry_udp(struct pt_regs *ctx, struct sock *sk)
+{
+	u32 pid = bpf_get_current_pid_tgid();
+
+	// stash the sock ptr for lookup on return
+	currsock_udp.update(&pid, &sk);
+
+	return 0;
+};
+
+static int trace_connect_return(struct pt_regs *ctx, short ipver)
+{
+	int ret = PT_REGS_RC(ctx);
+	u32 pid = bpf_get_current_pid_tgid();
+
+	struct sock **skpp;
+	skpp = currsock.lookup(&pid);
+	if (skpp == 0) {
+		return 0;   // missed entry
+	}
+	currsock.delete(&pid);
+
+	if (ret != 0) {
+		// failed to send SYNC packet, may not have populated
+		// socket __sk_common.{skc_rcv_saddr, ...}
+		return 0;
+	}
+
+	// pull in details
+	struct sock *skp = *skpp;
+	u16 dport = skp->__sk_common.skc_dport;
+	u16 sport = skp->__sk_common.skc_num;
+	
+	struct ipv4_data_t data4 = {};
+	struct ipv6_data_t data6 = {};
+
+	if (ipver == 4) {
+		data4.ts_us = bpf_ktime_get_ns() / 1000;
+		data4.pid = pid;
+		data4.saddr = skp->__sk_common.skc_rcv_saddr;
+		if (data4.saddr == 0 && data4.daddr == 0)  // tunnels
+			return 0;
+		data4.sport = sport;
+		data4.daddr = skp->__sk_common.skc_daddr;
+		data4.ip = ipver;
+		data4.dport = ntohs(dport);
+		data4.udp = 0;
+		ipv4_events.perf_submit(ctx, &data4, sizeof(data4));
+	} else /* 6 */ {
+		data6.ts_us = bpf_ktime_get_ns() / 1000;
+		data6.pid = pid;
+		bpf_probe_read(&data6.saddr, sizeof(data6.saddr),
+			skp->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+		bpf_probe_read(&data6.daddr, sizeof(data6.daddr),
+			skp->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+		data6.sport = sport;
+		data6.ip = ipver;
+		data6.dport = ntohs(dport);
+		data4.udp = 0;
+		ipv6_events.perf_submit(ctx, &data6, sizeof(data6));
+	}
+	return 0;
+}
+
+int trace_connect_v4_return(struct pt_regs *ctx)
+{
+	return trace_connect_return(ctx, 4);
+}
+
+int trace_connect_v6_return(struct pt_regs *ctx)
+{
+	return trace_connect_return(ctx, 6);
+}
+
+int trace_connect_udp_return(struct pt_regs *ctx)
+{
+	struct sock **skpp;
+	u32 pid = bpf_get_current_pid_tgid();
+	skpp = currsock_udp.lookup(&pid);
+	if (skpp == 0) {
+		return 0;   // missed entry
+	}
+	currsock_udp.delete(&pid);
+	struct sock *skp = *skpp;
+	u16 dport = skp->__sk_common.skc_dport;
+	u16 sport = skp->__sk_common.skc_num;
+	struct ipv4_data_t data4 = {};
+	struct ipv6_data_t data6 = {};
+
+	if (skp->sk_family == AF_INET6) {
+		data6.ts_us = bpf_ktime_get_ns() / 1000;
+		data6.pid = pid;
+		bpf_probe_read(&data6.saddr, sizeof(data6.saddr),
+			skp->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+		data6.sport = sport;
+		bpf_probe_read(&data6.daddr, sizeof(data6.daddr),
+			skp->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+		data6.ip = 6;
+		data6.dport = ntohs(dport);
+		data6.udp = 1;
+		ipv6_events.perf_submit(ctx, &data6, sizeof(data6));
+	} else {
+		data4.ts_us = bpf_ktime_get_ns() / 1000;
+		data4.pid = pid;
+		data4.saddr = skp->__sk_common.skc_rcv_saddr;
+		if (data4.saddr == 0 && data4.daddr == 0) // tunnels
+			return 0;
+		data4.sport = sport;
+		data4.daddr = skp->__sk_common.skc_daddr;
+		data4.ip = 4;
+		data4.dport = ntohs(dport);
+		data4.udp = 1;
+		ipv4_events.perf_submit(ctx, &data4, sizeof(data4));
+	}
+	return 0;
+}
+`
+
 var (
-	logFile      = ""
-	rulesPath    = "rules"
+	logFile	  = ""
+	rulesPath	= "rules"
 	noLiveReload = false
-	queueNum     = 0
-	workers      = 16
-	debug        = false
+	queueNum	 = 0
+	workers	  = 16
+	debug		= false
 
 	uiSocket = "unix:///tmp/osui.sock"
 	uiClient = (*ui.Client)(nil)
@@ -37,7 +207,7 @@ var (
 	cpuProfile = ""
 	memProfile = ""
 
-	err     = (error)(nil)
+	err	 = (error)(nil)
 	rules   = (*rule.Loader)(nil)
 	stats   = (*statistics.Statistics)(nil)
 	queue   = (*netfilter.Queue)(nil)
@@ -101,6 +271,94 @@ func worker(id int) {
 	}
 }
 
+func runKprobes() {
+	m := bpf.NewModule(source, []string{})
+	defer m.Close()
+	entry, err := m.LoadKprobe("trace_connect_entry")
+	if err != nil {
+		log.Error("LoadKprobe failed!", err)
+	}
+	entryUdp, err := m.LoadKprobe("trace_connect_entry_udp")
+	if err != nil {
+		log.Error("LoadKprobe failed!", err)
+	}
+	connect4Ret, err := m.LoadKprobe("trace_connect_v4_return")
+	if err != nil {
+		log.Error("LoadKprobe failed!", err)
+	}
+	connect6Ret, err := m.LoadKprobe("trace_connect_v6_return")
+	if err != nil {
+		log.Error("LoadKprobe failed!", err)
+	}
+	udpReturn, err := m.LoadKprobe("trace_connect_udp_return")
+	if err != nil {
+		log.Error("LoadKprobe failed!", err)
+	}
+	
+	err = m.AttachKprobe("tcp_v4_connect", entry)
+	err = m.AttachKprobe("tcp_v6_connect", entry)
+	err = m.AttachKprobe("udp_sendmsg", entryUdp)
+	err = m.AttachKretprobe("tcp_v4_connect", connect4Ret)
+	err = m.AttachKretprobe("tcp_v6_connect", connect6Ret)
+	err = m.AttachKretprobe("udp_sendmsg", udpReturn)
+
+	table4 := bpf.NewTable(m.TableId("ipv4_events"), m)
+	channel4 := make(chan []byte)
+	perfMap4, err := bpf.InitPerfMap(table4, channel4)
+	if err != nil {
+		perfMap4 = nil
+	}
+
+	table6 := bpf.NewTable(m.TableId("ipv6_events"), m)
+	channel6 := make(chan []byte)
+	perfMap6, err := bpf.InitPerfMap(table6, channel6)
+	if err != nil {
+		perfMap6 = nil
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, os.Kill)
+
+	go (func() {
+		for {
+			var event netstat.Ip4Event
+			data := <-channel4
+			binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &event)
+			if event.Udp == 1 {
+				netstat.UDPCache.Add(event.Sport, event)
+			} else {
+				netstat.TCPCache.Add(event.Sport, event)
+			}
+		}
+	})()
+	go (func() {
+		for {
+			var event netstat.Ip6Event
+			data := <-channel6
+			binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &event)
+			if event.Udp == 1 {
+				netstat.UDPCache.Add(event.Sport, event)
+			} else {
+				netstat.TCPCache.Add(event.Sport, event)
+			}
+		}
+	})()
+
+	if perfMap4 != nil {
+		perfMap4.Start()
+	}
+	if perfMap6 != nil {
+		perfMap6.Start()
+	}
+	<-sig
+	if perfMap4 != nil {
+		perfMap4.Stop()
+	}
+	if perfMap6 != nil {
+		perfMap6.Stop()
+	}
+}
+
 func setupWorkers() {
 	log.Debug("Starting %d workers ...", workers)
 	// setup the workers
@@ -108,6 +366,8 @@ func setupWorkers() {
 	for i := 0; i < workers; i++ {
 		go worker(i)
 	}
+
+	go runKprobes()
 }
 
 func doCleanup() {

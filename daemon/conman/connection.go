@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"github.com/evilsocket/opensnitch/daemon/dns"
 	"github.com/evilsocket/opensnitch/daemon/log"
@@ -66,10 +67,45 @@ func Parse(nfp netfilter.Packet) *Connection {
 	}
 }
 
+func tryBPF(nfp *netfilter.Packet, c *Connection) (cr *Connection, err error) {
+	port := uint16(c.SrcPort)
+	if event, ok := netstat.UDPCache.Get(port); ok && c.Protocol == "udp" {
+		e4 := event.(netstat.Ip4Event)
+		c.Process = procmon.FindProcess(int(e4.Pid))
+		entry := netstat.NewEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort, nfp.Uid, int(e4.Pid))
+		c.Entry = &entry
+		return c, nil
+	} else if event, ok := netstat.TCPCache.Get(port); ok && c.Protocol == "tcp" {
+		e4 := event.(netstat.Ip4Event)
+		c.Process = procmon.FindProcess(int(e4.Pid))
+		entry := netstat.NewEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort, nfp.Uid, int(e4.Pid))
+		c.Entry = &entry
+		return c, nil
+	} else if event, ok := netstat.UDPCache.Get(port); ok && c.Protocol == "udp6" {
+		e6 := event.(netstat.Ip6Event)
+		c.Process = procmon.FindProcess(int(e6.Pid))
+		entry := netstat.NewEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort, nfp.Uid, int(e6.Pid))
+		c.Entry = &entry
+		return c, nil
+	} else if event, ok := netstat.TCPCache.Get(port); ok && c.Protocol == "tcp6" {
+		e6 := event.(netstat.Ip6Event)
+		c.Process = procmon.FindProcess(int(e6.Pid))
+		entry := netstat.NewEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort, nfp.Uid, int(e6.Pid))
+		c.Entry = &entry
+		return c, nil
+	}
+	return nil, nil
+}
+
 func newConnectionImpl(nfp *netfilter.Packet, c *Connection) (cr *Connection, err error) {
 	// no errors but not enough info neither
 	if c.parseDirection() == false {
 		return nil, nil
+	}
+	
+	conn, err := tryBPF(nfp, c)
+	if conn != nil {
+		return conn, nil
 	}
 
 	// 1. lookup uid and inode using /proc/net/(udp|tcp)
@@ -77,17 +113,38 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection) (cr *Connection, er
 	// 3. if this is coming from us, just accept
 	// 4. lookup process info by pid
 	if c.Entry = netstat.FindEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort); c.Entry == nil {
+		// Try once more after 0.5s in case of a race:
+		time.Sleep(1000 * 500);
+		conn, err = tryBPF(nfp, c)
+		if conn != nil {
+			return conn, nil
+		}
+		
 		entry := netstat.NewEntry(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort, nfp.Uid, -1)
 		c.Entry = &entry
 		c.Process = procmon.NewProcess(-1, "")
 		return c, fmt.Errorf("Could not find netstat entry for: %s", c)
 	} else if pid := procmon.GetPIDFromINode(c.Entry.INode); pid == -1 {
+		// Try once more after 0.5s in case of a race:
+		time.Sleep(1000 * 500);
+		conn, err = tryBPF(nfp, c)
+		if conn != nil {
+			return conn, nil
+		}
+
 		c.Process = procmon.NewProcess(-1, "")
 		return c, fmt.Errorf("Could not find process id for: %s", c)
 	} else if pid == os.Getpid() {
 		return nil, nil
 	} else if c.Process = procmon.FindProcess(pid); c.Process == nil {
 		return c, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
+	}
+
+	// Try once more after 0.5s in case of a race:
+	time.Sleep(1000 * 500);
+	conn, err = tryBPF(nfp, c)
+	if conn != nil {
+		return conn, nil
 	}
 	return c, nil
 

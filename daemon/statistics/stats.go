@@ -140,17 +140,19 @@ func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasM
 		s.Dropped++
 	}
 
-	s.incMap(&s.ByProto, con.Protocol)
-	s.incMap(&s.ByAddress, con.DstIP.String())
-	if con.DstHost != "" {
-		s.incMap(&s.ByHost, con.DstHost)
-	}
-	s.incMap(&s.ByPort, fmt.Sprintf("%d", con.DstPort))
-	if (con.Entry != nil) {
-		s.incMap(&s.ByUID, fmt.Sprintf("%d", con.Entry.UserId))
-	}
-	if (con.Process != nil) {
-		s.incMap(&s.ByExecutable, con.Process.Path)
+	if (con != nil) {
+		s.incMap(&s.ByProto, con.Protocol)
+		s.incMap(&s.ByAddress, con.DstIP.String())
+		if con.DstHost != "" {
+			s.incMap(&s.ByHost, con.DstHost)
+		}
+		s.incMap(&s.ByPort, fmt.Sprintf("%d", con.DstPort))
+		if (con.Entry != nil) {
+			s.incMap(&s.ByUID, fmt.Sprintf("%d", con.Entry.UserId))
+		}
+		if (con.Process != nil) {
+			s.incMap(&s.ByExecutable, con.Process.Path)
+		}
 	}
 
 	// if we reached the limit, shift everything back

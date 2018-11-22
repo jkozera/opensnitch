@@ -23,9 +23,17 @@ func NewEvent(con *conman.Connection, match *rule.Rule) *Event {
 }
 
 func (e *Event) Serialize() *protocol.Event {
+	var conn *protocol.Connection
+	var rule *protocol.Rule
+	if e.Connection != nil {
+		conn = e.Connection.Serialize()
+	}
+	if e.Rule != nil {
+		rule = e.Rule.Serialize()
+	}
 	return &protocol.Event{
 		Time:       e.Time.Format("2006-01-02 15:04:05"),
-		Connection: e.Connection.Serialize(),
-		Rule:       e.Rule.Serialize(),
+		Connection: conn,
+		Rule:       rule,
 	}
 }
